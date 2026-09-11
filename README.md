@@ -27,10 +27,11 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-All five values in `.env.example` are required: the controller URL, controller
-login, password, and separate READ / CONTROL API keys. Generate two independent
-random keys (for example with `openssl rand -hex 32`). Do not commit `.env`.
-Starting the API connects to the configured controller for background reads.
+The controller URL, controller login, password, and separate READ / CONTROL API
+keys are required. Generate two independent random keys (for example with
+`openssl rand -hex 32`). `HEMS_DISABLE_LOCK` is optional and defaults to
+`false`. Do not commit `.env`. Starting the API connects to the configured
+controller for background reads.
 
 The default port binding accepts connections only from the local host. For Home
 Assistant on another host, deliberately bind to a trusted LAN interface or use a
@@ -53,6 +54,19 @@ The example refreshes state after an air-conditioning command even when the HTTP
 request fails, and retains only validated snapshots. A timeout can mean the
 device received the command: inspect state before retrying. Do not automatically
 resend controls after an error.
+
+### Homes without a door lock, or with lock control disabled
+
+The API detects the floors, door lock, and shutter exposed by each controller
+session. `GET /status` returns the detected `floors`; add or remove the
+floor-specific blocks in `configuration_hems.yaml.example` to match that list.
+Missing security devices are reported as `NOT_INSTALLED` and are not controlled.
+
+Set `HEMS_DISABLE_LOCK=true` to keep an installed lock visible as `DISABLED`
+while refusing lock commands. Remove the lock REST command, MQTT lock, and lock
+automation blocks from the Home Assistant example when no lock is installed or
+lock control is disabled. Shutter publishing is independent and continues when
+the lock is unavailable.
 
 ## Development and image checks
 

@@ -27,6 +27,15 @@ CONTROL_TOTAL_SECONDS = 25.0
 CONTROL_REPLY_RESERVE_SECONDS = 1.0
 
 
+def parse_bool_env(name: str, default: str = "false") -> bool:
+    value = os.environ.get(name, default).lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false'")
+
+
 class FrameError(RuntimeError):
     """IPC frame が protocol として不正、または期限までに完結しなかった。"""
 
@@ -103,6 +112,7 @@ class _Worker:
     process: subprocess.Popen[bytes]
     sock: socket.socket
     pgid: int
+    floors: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -126,6 +136,7 @@ class SeleniumRuntime:
         self._admission_open = True
         self._lifecycle_lock = threading.Lock()
         self._worker: _Worker | None = None
+        self._floors: tuple[int, ...] | None = None
         self._cooldown_until = 0.0
         self._prewarming = False
         self._fatal_exit = fatal_exit
@@ -155,6 +166,7 @@ class SeleniumRuntime:
                     return False
                 with self._lifecycle_lock:
                     self._worker = worker
+                    self._floors = worker.floors
             return True
         finally:
             with self._lifecycle_lock:
@@ -193,6 +205,11 @@ class SeleniumRuntime:
     def control_waiting(self) -> bool:
         with self._admission:
             return self._control_waiting
+
+    @property
+    def floors(self) -> tuple[int, ...] | None:
+        with self._lifecycle_lock:
+            return self._floors
 
     def execute_refresh(
         self,
@@ -330,8 +347,20 @@ class SeleniumRuntime:
     def close(self) -> None:
         with self._lifecycle_lock:
             worker, self._worker = self._worker, None
+            self._floors = None
         if worker is not None:
             self._terminate_worker(worker)
+
+    @staticmethod
+    def _validated_floors(value) -> tuple[int, ...]:
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(type(floor) is not int or floor <= 0 for floor in value)
+            or value != sorted(set(value))
+        ):
+            raise RuntimeError("invalid worker ready handshake")
+        return tuple(value)
 
     def _spawn_worker(self) -> _Worker:
         self._assert_container_is_clean()
@@ -357,8 +386,9 @@ class SeleniumRuntime:
             ready = recv_frame(parent, deadline)
             if ready.get("type") != "ready" or ready.get("pid") != process.pid or ready.get("pgid") != pgid:
                 raise RuntimeError("invalid worker ready handshake")
+            floors = self._validated_floors(ready.get("floors"))
             self._assert_descendants_in_group(process.pid, pgid)
-            return _Worker(process=process, sock=parent, pgid=pgid)
+            return _Worker(process=process, sock=parent, pgid=pgid, floors=floors)
         except Exception:
             parent.close()
             self._terminate_process(process, process.pid)
@@ -368,6 +398,7 @@ class SeleniumRuntime:
         with self._lifecycle_lock:
             if self._worker is worker:
                 self._worker = None
+                self._floors = None
         self._terminate_worker(worker)
 
     def _terminate_worker(self, worker: _Worker) -> None:
@@ -811,7 +842,16 @@ def worker_main(fd: int) -> int:
     try:
         controller.login(deadline=startup_deadline)
         controller.navigate_to_smart_airs(deadline=startup_deadline)
-        send_frame(sock, {"type": "ready", "pid": os.getpid(), "pgid": os.getpgrp()}, startup_deadline)
+        send_frame(
+            sock,
+            {
+                "type": "ready",
+                "pid": os.getpid(),
+                "pgid": os.getpgrp(),
+                "floors": controller.detected_floors(),
+            },
+            startup_deadline,
+        )
         while True:
             command = recv_frame(sock, None)
             if command.get("type") != "command" or not isinstance(command.get("operation"), str) or not isinstance(command.get("payload"), dict) or not isinstance(command.get("deadline"), (int, float)):

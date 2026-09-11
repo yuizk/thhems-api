@@ -26,6 +26,7 @@ def _status(**overrides):
 class FakeRuntime:
     def __init__(self):
         self.calls = []
+        self.floors = (1, 2)
         self.responses = deque()
         self.fail_after_admission = False
         self.after_send_exception = None
@@ -51,7 +52,11 @@ class FakeRuntime:
         if operation == "status":
             return 200, _status(floor=payload.get("floor") or 1)
         if operation == "security_status":
-            return 200, {"lock": "LOCKED", "shutter": "CLOSED"}
+            return 200, {
+                "lock": "LOCKED",
+                "shutter": "CLOSED",
+                "capabilities": {"lock": "available", "shutter": "available"},
+            }
         if operation == "control":
             return 200, _status(
                 floor=payload.get("floor") or 1,
@@ -59,7 +64,11 @@ class FakeRuntime:
                 temperature=payload.get("temp") or 25.0,
                 power=payload.get("power") or "ON",
             )
-        return 200, {"lock": "LOCKED", "shutter": "CLOSED"}
+        return 200, {
+            "lock": "LOCKED",
+            "shutter": "CLOSED",
+            "capabilities": {"lock": "available", "shutter": "available"},
+        }
 
 
 class FakeSnapshots:
@@ -67,7 +76,15 @@ class FakeSnapshots:
         self.responses = {
             "aircon:1": (200, {**_status(floor=1), "snapshot": {"stale": False}}),
             "aircon:2": (200, {**_status(floor=2), "snapshot": {"stale": False}}),
-            "security": (200, {"lock": "LOCKED", "shutter": "CLOSED", "snapshot": {"stale": False}}),
+            "security": (
+                200,
+                {
+                    "lock": "LOCKED",
+                    "shutter": "CLOSED",
+                    "capabilities": {"lock": "available", "shutter": "available"},
+                    "snapshot": {"stale": False},
+                },
+            ),
         }
 
     def response(self, key):
@@ -115,6 +132,16 @@ def test_api_parent_fails_fast_when_worker_credential_is_missing(monkeypatch, mi
     try:
         expected = "HEMS_URL" if missing == "HEMS_URL" else "HEMS_USER and HEMS_PASSWORD"
         with pytest.raises(ValueError, match=expected):
+            importlib.import_module("hems_api")
+    finally:
+        sys.modules["hems_api"] = original
+
+
+def test_api_parent_fails_fast_for_invalid_disable_lock(monkeypatch):
+    original = sys.modules.pop("hems_api")
+    monkeypatch.setenv("HEMS_DISABLE_LOCK", "enabled")
+    try:
+        with pytest.raises(ValueError, match="HEMS_DISABLE_LOCK"):
             importlib.import_module("hems_api")
     finally:
         sys.modules["hems_api"] = original
@@ -197,10 +224,48 @@ def test_authenticated_status_requires_floor_and_gets_are_runtime_free(api_clien
     security = api_client.get("/security/status", headers=_headers())
 
     assert missing.status_code == 400
-    assert missing.get_json() == {"error": "Invalid floor. Use 1 or 2"}
+    assert missing.get_json() == {"error": "Invalid floor"}
     assert floor.status_code == 200
     assert floor.get_json()["floor"] == 2
+    assert floor.get_json()["floors"] == [1, 2]
     assert security.status_code == 200
+    assert runtime.calls == []
+
+
+def test_status_and_control_follow_detected_one_and_three_floor_configuration(
+    api_client, runtime
+):
+    runtime.floors = (1, 3)
+    hems_api.snapshots.responses["aircon:3"] = (
+        200,
+        {**_status(floor=3), "snapshot": {"stale": False}},
+    )
+
+    status = api_client.get("/status?floor=3", headers=_headers())
+    invalid = api_client.get("/status?floor=2", headers=_headers())
+    control = api_client.post(
+        "/control", json={"power": "ON"}, headers=_headers(CONTROL_KEY)
+    )
+
+    assert status.status_code == 200
+    assert status.get_json()["floors"] == [1, 3]
+    assert invalid.status_code == 400
+    assert control.status_code == 200
+    assert hems_api.coordinator.targets == [{"aircon:1", "aircon:3"}]
+
+
+def test_floor_endpoints_fail_closed_until_worker_floors_are_known(api_client, runtime):
+    runtime.floors = None
+
+    status = api_client.get("/status?floor=1", headers=_headers())
+    control = api_client.post(
+        "/control", json={"floor": 1, "power": "ON"}, headers=_headers(CONTROL_KEY)
+    )
+
+    assert status.status_code == 503
+    assert control.status_code == 503
+    assert status.get_json()["reason"] == "floors_unknown"
+    assert control.get_json()["reason"] == "floors_unknown"
     assert runtime.calls == []
 
 
@@ -264,7 +329,7 @@ def test_post_endpoints_require_json_object(api_client, runtime, body):
     ("body", "error"),
     [
         ({"floor": 1.5}, "Invalid floor"),
-        ({"floor": 3}, "Invalid floor. Use 1 or 2"),
+        ({"floor": 3}, "Invalid floor. Use one of: 1, 2"),
         ({"mode": "暖房冷房"}, "Invalid mode"),
         ({"temp": "warm"}, "Invalid temp"),
         ({"temp": 16}, "Invalid temp. Must be between 17 and 30"),
@@ -294,6 +359,68 @@ def test_security_action_validation_does_not_reach_runtime(api_client, runtime, 
     assert response.status_code == 400
     assert response.get_json() == {"error": error}
     assert runtime.calls == []
+
+
+@pytest.mark.parametrize(
+    ("path", "capabilities", "status", "reason"),
+    [
+        (
+            "/security/lock",
+            {"lock": "disabled", "shutter": "available"},
+            403,
+            "lock_disabled",
+        ),
+        (
+            "/security/lock",
+            {"lock": "not_installed", "shutter": "available"},
+            501,
+            "lock_not_installed",
+        ),
+        (
+            "/security/shutter",
+            {"lock": "available", "shutter": "not_installed"},
+            501,
+            "shutter_not_installed",
+        ),
+    ],
+)
+def test_security_capability_rejection_precedes_rpc_and_rate_window(
+    api_client, runtime, path, capabilities, status, reason
+):
+    hems_api.snapshots.responses["security"] = (
+        200,
+        {
+            "lock": "DISABLED",
+            "shutter": "NOT_INSTALLED",
+            "capabilities": capabilities,
+            "snapshot": {"stale": False},
+        },
+    )
+    action = "lock" if path.endswith("lock") else "open"
+
+    first = api_client.post(path, json={"action": action}, headers=_headers(CONTROL_KEY))
+    second = api_client.post(path, json={"action": action}, headers=_headers(CONTROL_KEY))
+
+    assert [first.status_code, second.status_code] == [status, status]
+    assert first.get_json()["reason"] == reason
+    assert runtime.calls == []
+    assert hems_api.coordinator.targets == []
+
+
+def test_security_control_fails_closed_when_capabilities_are_unknown(api_client, runtime):
+    hems_api.snapshots.responses["security"] = (
+        503,
+        {"error": "HEMS snapshot unavailable", "snapshot": {"stale": True}},
+    )
+
+    response = api_client.post(
+        "/security/lock", json={"action": "lock"}, headers=_headers(CONTROL_KEY)
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["reason"] == "capabilities_unknown"
+    assert runtime.calls == []
+    assert hems_api.coordinator.targets == []
 
 
 def test_control_ignores_unknown_fields_and_normalizes_whole_temperature(api_client, runtime):
@@ -452,6 +579,14 @@ def test_confirmed_control_seeds_snapshot_so_next_read_sees_post_control_state(
 
 
 def test_confirmed_security_control_seeds_security_snapshot(api_client, runtime, real_snapshots):
+    real_snapshots.record_success(
+        "security",
+        {
+            "lock": "UNLOCKED",
+            "shutter": "CLOSED",
+            "capabilities": {"lock": "available", "shutter": "available"},
+        },
+    )
     assert api_client.post(
         "/security/lock", json={"action": "lock"}, headers=_headers(CONTROL_KEY)
     ).status_code == 200
@@ -505,6 +640,8 @@ def test_off_to_on_observation_is_replaced_by_later_targeted_refresh(
     api_client, runtime, real_snapshots, monkeypatch
 ):
     class RefreshRuntime:
+        floors = (1, 2)
+
         def execute_refresh(self, operation, payload, *, timeout_seconds):
             assert (operation, payload, timeout_seconds) == ("status", {"floor": 1}, 6.0)
             return 200, _status(mode="除湿", temperature=None, power="ON")

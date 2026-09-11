@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 
-from hems_runtime import RuntimeUnavailable, SeleniumRuntime
+from hems_runtime import RuntimeUnavailable, SeleniumRuntime, parse_bool_env
 from hems_snapshot import SnapshotCoordinator, SnapshotStore
 
 
@@ -24,6 +24,7 @@ if not API_KEY_READ:
     raise ValueError("HEMS_API_KEY_READ environment variable must be set.")
 if not API_KEY_CONTROL:
     raise ValueError("HEMS_API_KEY_CONTROL environment variable must be set.")
+parse_bool_env("HEMS_DISABLE_LOCK")
 
 # import は process/Chrome を一切起動しない。互換用 controller は Selenium を持たない。
 controller = None
@@ -62,6 +63,42 @@ def _parse_json_object():
     if not isinstance(data, dict):
         return None, (jsonify({"error": "Request body must be a JSON object"}), 400)
     return data, None
+
+
+def _known_floors():
+    floors = runtime.floors
+    if floors is None:
+        return None, (
+            jsonify({
+                "error": "HEMS floor capabilities unavailable",
+                "reason": "floors_unknown",
+            }),
+            503,
+        )
+    return tuple(floors), None
+
+
+def _invalid_floor_response(floors=None):
+    if floors:
+        choices = ", ".join(str(floor) for floor in floors)
+        return jsonify({"error": f"Invalid floor. Use one of: {choices}"}), 400
+    return jsonify({"error": "Invalid floor"}), 400
+
+
+def _security_capability_response(device):
+    status, body = snapshots.response("security")
+    capabilities = body.get("capabilities") if status == 200 else None
+    capability = capabilities.get(device) if isinstance(capabilities, dict) else None
+    if capability == "available":
+        return None
+    if device == "lock" and capability == "disabled":
+        return jsonify({"reason": "lock_disabled"}), 403
+    if capability == "not_installed":
+        return jsonify({"reason": f"{device}_not_installed"}), 501
+    return jsonify({
+        "error": "HEMS security capabilities unavailable",
+        "reason": "capabilities_unknown",
+    }), 503
 
 
 def _rate_limit_allows(path: str) -> bool:
@@ -156,14 +193,20 @@ def handle_unexpected_exception(error):
 def get_status():
     floor_param = request.args.get("floor")
     if floor_param is None:
-        return jsonify({"error": "Invalid floor. Use 1 or 2"}), 400
+        return _invalid_floor_response()
     try:
         floor = int(floor_param)
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid floor. Use 1 or 2"}), 400
-    if str(floor) != floor_param or floor not in (1, 2):
-        return jsonify({"error": "Invalid floor. Use 1 or 2"}), 400
+        return _invalid_floor_response()
+    if str(floor) != floor_param:
+        return _invalid_floor_response()
+    floors, error_response = _known_floors()
+    if error_response:
+        return error_response
+    if floor not in floors:
+        return _invalid_floor_response(floors)
     status, body = snapshots.response(f"aircon:{floor}")
+    body["floors"] = list(floors)
     return jsonify(body), status
 
 
@@ -182,8 +225,6 @@ def control_ac():
     if floor is not None:
         if type(floor) is not int:
             return jsonify({"error": "Invalid floor"}), 400
-        if floor not in (1, 2):
-            return jsonify({"error": "Invalid floor. Use 1 or 2"}), 400
     if mode is not None and mode not in {"暖房", "冷房", "除湿", "自動", "送風"}:
         return jsonify({"error": "Invalid mode"}), 400
     if temp is not None:
@@ -196,7 +237,16 @@ def control_ac():
             return jsonify({"error": "Invalid temp. Must be between 17 and 30"}), 400
     if power is not None and power not in ("ON", "OFF"):
         return jsonify({"error": "Invalid power. Use 'ON' or 'OFF'"}), 400
-    refresh_keys = {f"aircon:{floor}"} if floor is not None else {"aircon:1", "aircon:2"}
+    floors, error_response = _known_floors()
+    if error_response:
+        return error_response
+    if floor is not None and floor not in floors:
+        return _invalid_floor_response(floors)
+    refresh_keys = (
+        {f"aircon:{floor}"}
+        if floor is not None
+        else {f"aircon:{detected}" for detected in floors}
+    )
     return _rpc(
         "control",
         {"floor": floor, "mode": mode, "temp": temp, "power": power},
@@ -213,6 +263,9 @@ def control_lock():
     action = data.get("action")
     if action not in ("lock", "unlock"):
         return jsonify({"error": "Invalid action. Use 'lock' or 'unlock'"}), 400
+    capability_response = _security_capability_response("lock")
+    if capability_response:
+        return capability_response
     return _rpc(
         "lock",
         {"action": action},
@@ -230,6 +283,9 @@ def control_shutter():
     action = data.get("action")
     if action not in ("open", "close"):
         return jsonify({"error": "Invalid action. Use 'open' or 'close'"}), 400
+    capability_response = _security_capability_response("shutter")
+    if capability_response:
+        return capability_response
     return _rpc(
         "shutter",
         {"action": action},

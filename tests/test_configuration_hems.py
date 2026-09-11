@@ -40,6 +40,30 @@ def test_ha_copy_retained_state_guards_reject_invalid_snapshot_values():
     assert "'shutter') in ['OPEN', 'CLOSED']" in text
 
 
+def test_security_publish_guards_lock_and_shutter_independently():
+    config = _ha_config()
+    automation = next(
+        item
+        for item in config["automation"]
+        if item["alias"] == "HEMS Security: Sync Status to MQTT"
+    )
+
+    top_guard = automation["condition"][0]["value_template"]
+    assert "not in ['unknown', 'unavailable']" in top_guard
+    assert "'lock') in" not in top_guard
+    assert "'shutter') in" not in top_guard
+
+    actions = automation["action"]
+    assert len(actions) == 2
+    assert all("if" in action and "then" in action for action in actions)
+    lock_guard = actions[0]["if"][0]["value_template"]
+    shutter_guard = actions[1]["if"][0]["value_template"]
+    assert "'lock') in ['LOCKED', 'UNLOCKED']" in lock_guard
+    assert "'shutter') in ['OPEN', 'CLOSED']" in shutter_guard
+    assert actions[0]["then"][0]["data"]["topic"] == "hems/security/lock/state"
+    assert actions[1]["then"][0]["data"]["topic"] == "hems/security/shutter/state"
+
+
 def test_ha_copy_does_not_add_trigger_based_poll_serialization():
     text = CONFIG.read_text()
     sensor_section = text.split("rest_command:", 1)[0]
@@ -105,6 +129,7 @@ _HaLoader.add_multi_constructor("!", lambda loader, suffix, node: f"!{suffix}")
 class _CapturingRuntime:
     def __init__(self):
         self.payloads = []
+        self.floors = (1, 2)
 
     def execute_control(self, operation, payload, *, deadline, before_execute=None, after_send=None):
         self.payloads.append(payload)

@@ -748,6 +748,29 @@ def test_spawn_worker_closes_both_socketpair_ends_when_popen_fails(monkeypatch):
     assert child.closed is True
 
 
+@pytest.mark.parametrize("floors", [None, [], [1, 1], [2, 1], [0], [True], ["1"]])
+def test_ready_handshake_rejects_invalid_floor_lists(floors):
+    with pytest.raises(RuntimeError, match="invalid worker ready handshake"):
+        SeleniumRuntime._validated_floors(floors)
+
+
+def test_ready_handshake_accepts_positive_sorted_unique_floor_list():
+    assert SeleniumRuntime._validated_floors([1, 3]) == (1, 3)
+
+
+def test_runtime_floors_follow_ready_worker_and_clear_on_retire(monkeypatch):
+    runtime = SeleniumRuntime()
+    worker = types.SimpleNamespace(floors=(1, 3))
+    monkeypatch.setattr(runtime, "_spawn_worker", lambda: worker)
+    monkeypatch.setattr(runtime, "_terminate_worker", lambda value: None)
+
+    assert runtime.prewarm() is True
+    assert runtime.floors == (1, 3)
+
+    runtime._retire(worker)
+    assert runtime.floors is None
+
+
 def test_worker_operation_never_relogs_in_request():
     class Controller:
         def __init__(self):
@@ -1187,6 +1210,9 @@ def test_worker_converts_expected_timeout_to_result_and_remains_alive(monkeypatc
         def navigate_to_smart_airs(self, **kwargs):
             pass
 
+        def detected_floors(self):
+            return [1, 2]
+
         def ensure_connection(self, **kwargs):
             return True
 
@@ -1268,6 +1294,9 @@ def test_session_death_closes_worker_and_parent_retires_then_cools_down(monkeypa
         def navigate_to_smart_airs(self, **_kwargs):
             pass
 
+        def detected_floors(self):
+            return [1, 2]
+
         def ensure_connection(self, **_kwargs):
             return True
 
@@ -1339,6 +1368,9 @@ def test_ready_worker_survives_idle_longer_than_startup_window(monkeypatch):
 
         def navigate_to_smart_airs(self, **kwargs):
             pass
+
+        def detected_floors(self):
+            return [1, 2]
 
         def ensure_connection(self, **kwargs):
             return True

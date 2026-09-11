@@ -21,7 +21,7 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-`.env.example` に記載されている5つの値はすべて必須です: コントローラーのURL、コントローラーのログインID、パスワード、および独立した READ / CONTROL 用の各APIキー。2つの独立したランダムなキー（例: `openssl rand -hex 32` など）を生成してください。`.env` はコミットしないでください。APIが起動すると、バックグラウンド読み取りのために設定されたコントローラーへの接続が行われます。
+コントローラーのURL、ログインID、パスワード、および独立した READ / CONTROL 用の各APIキーは必須です。2つの独立したランダムなキー（例: `openssl rand -hex 32` など）を生成してください。`HEMS_DISABLE_LOCK` は任意で、既定値は `false` です。`.env` はコミットしないでください。APIが起動すると、バックグラウンド読み取りのために設定されたコントローラーへの接続が行われます。
 
 デフォルトのポートバインドはローカルホストからの接続のみを許可します。別ホストにある Home Assistant から接続する場合は、信頼できるLANインターフェースへ意図的にバインドするか、TLSリバースプロキシとファイアウォールを使用してください。APIキーは通信を暗号化しないため、APIをインターネットへ直接公開しないでください。READキーはGETリクエストのみを許可し、CONTROLキーは読み取りと機器の物理制御の両方を許可します。詳細は [APIリファレンス](docs/api-reference.md) を参照してください。
 
@@ -32,6 +32,12 @@ Compose設定はブラウザ実行に必要な `seccomp:unconfined` および Ch
 `configuration_hems.yaml.example` をパッケージ／設定例として使用してください。`hems-api.example.invalid` をAPIホストに置き換え、Home Assistant の `secrets.yaml` に `hems_api_key_read` と `hems_api_key_control` を設定します。この例では Home Assistant の MQTT 統合とブローカーが必要です。既存の設定とマージし、リロード前に YAML の構文チェックを実施してください。
 
 この設定例では、HTTPリクエストが失敗した場合でも空調コマンド実行後に状態を再取得し、検証済みのスナップショットのみを保持します。タイムアウトが発生した場合でも、機器側にはコマンドが届いている可能性があります。再試行する前に現在の状態を確認してください。エラー発生時に制御コマンドを自動で再送しないでください。
+
+### 電気錠がない／使わない場合
+
+APIはログインセッションごとに、コントローラーが提示する階数・電気錠・シャッターを検出します。`GET /status` が返す `floors` に合わせて、`configuration_hems.yaml.example` の階別 REST sensor・MQTT climate・automation ブロックを増減してください。未搭載の防犯機器は `NOT_INSTALLED` として表示し、制御しません。
+
+搭載済みの電気錠をAPIから操作させない場合は `HEMS_DISABLE_LOCK=true` を設定します。防犯ステータスでは `DISABLED` と表示し、施錠・解錠要求を拒否します。電気錠がない場合または無効化する場合は、Home Assistant 設定例の電気錠用 REST command・MQTT lock・automation ブロックを削除してください。シャッターのpublishは電気錠と独立して継続します。
 
 ## 開発とイメージ検証
 

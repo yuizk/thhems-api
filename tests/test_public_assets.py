@@ -12,6 +12,7 @@ PLACEHOLDERS = {
     "HEMS_PASSWORD": "replace-with-hems-password",
     "HEMS_API_KEY_READ": "replace-with-random-read-key",
     "HEMS_API_KEY_CONTROL": "replace-with-random-control-key",
+    "HEMS_DISABLE_LOCK": "false",
 }
 
 

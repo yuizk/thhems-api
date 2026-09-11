@@ -6,7 +6,7 @@
 
 GET（`/status`、`/security/status`）はSelenium workerを呼ばず、background refresherが作ったsnapshotを即時に返す。background read commandは6秒、制御（`/control`、`/security/lock`、`/security/shutter`）はHTTP受付時から25秒の絶対deadlineで処理する。worker timeout時のprocess group回収には最大2秒を加える。Home Assistant側はREST sensorを10秒、`rest_command`を30秒としている。
 
-snapshotは`aircon:1`、`aircon:2`、`security`を独立管理し、1F→2F→securityの順に60秒周期で更新する。直近refreshが成功し観測から90秒未満の値だけ`200`とし、未取得・直近失敗・90秒以上では古い状態bodyを返さず`503 HEMS snapshot unavailable`とmetadataを返す。失敗時は最後の成功値と観測時刻を内部で維持するが公開せず、次の成功時だけ復旧する。
+snapshotはworkerが検出した各階の`aircon:<floor>`と`security`を独立管理し、60秒周期で更新する。worker再生成で階一覧が変わると、消えた階のsnapshotと更新待ちを破棄する。直近refreshが成功し観測から90秒未満の値だけ`200`とし、未取得・直近失敗・90秒以上では古い状態bodyを返さず`503 HEMS snapshot unavailable`とmetadataを返す。失敗時は最後の成功値と観測時刻を内部で維持するが公開せず、次の成功時だけ復旧する。
 
 controlは実行中の1 refresh完了後に1件だけ待機でき、後続refreshより優先される。追加controlは`503`でqueueしない。workerへframeを送ったcontrolは、単一対象の確認済み200をseedできた場合を除いて対象状態を優先refreshするが、制御を自動再送せず、要求値や未検証のcontrol responseをsnapshotへ直接反映しない。HTTP応答後にHome Assistantが行うread-onlyな`homeassistant.update_entity`で、実機の観測値を再取得する。
 
@@ -16,14 +16,19 @@ controlは実行中の1 refresh完了後に1件だけ待機でき、後続refres
 
 1. 認証・権限: キー欠如/不一致は`401`、READキーで制御系を呼んだ場合は`403`。
 2. JSON・入力検証: 不正なContent-Type、JSON、パラメータは`400`。認証後、レート制限より先に検証する。
-3. runtime利用可能性: controlの追加待機、worker起動/回収中、生成失敗、deadline超過は`503`。これは制御結果が未確定であることを示す。GETはruntime admissionへ入らない。
-4. security制御のレート制限: 検証を通過して受理された`/security/lock`・`/security/shutter`の3秒以内の連投は`429`。`503`のbusy/runtime unavailableはレート制限窓を消費しない。
+3. capability検証: 階一覧・防犯機器構成が未確定なら`503`、無効化した錠は`403`、未搭載機器は`501`。workerやレート制限窓を消費しない。
+4. runtime利用可能性: controlの追加待機、worker起動/回収中、生成失敗、deadline超過は`503`。これは制御結果が未確定であることを示す。GETはruntime admissionへ入らない。
+5. security制御のレート制限: 検証を通過して受理された`/security/lock`・`/security/shutter`の3秒以内の連投は`429`。`503`のbusy/runtime unavailableはレート制限窓を消費しない。
 
 | 状況 | 応答 | 意味とクライアント動作 |
 |---|---:|---|
 | 認証情報がない/不正 | 401 | キーを確認する。自動再送しない。 |
 | READキーで制御系を呼ぶ | 403 | CONTROLキーと権限を確認する。 |
 | JSONまたは入力が不正 | 400 | 本文を修正してから送る。実機操作は開始されていない。 |
+| 検出階が未確定 (`reason=floors_unknown`) | 503 | worker ready前のため空調の読取・制御を行わない。 |
+| 防犯構成が未取得/stale (`reason=capabilities_unknown`) | 503 | 錠・シャッターを制御せず、freshな防犯snapshotを待つ。 |
+| 電気錠を無効化済み (`reason=lock_disabled`) | 403 | 設定による明示拒否。workerへ要求を送らない。 |
+| 錠/シャッターが未搭載 (`reason=*_not_installed`) | 501 | 対象機器がないためworkerへ要求を送らない。 |
 | OFF→ON後の確認不能 (`reason=off_to_on_unverified`) | 503 | 電源ONへの遷移後にmode/tempを確認できない。`actual`はworkerが観測した値であり、再送せずGETで確認する。 |
 | stage/HTTP絶対期限超過 (`reason=control_deadline_exhausted`) | 503 | 結果未確定。`actual`が含まれる場合も要求値ではなく観測値であり、再送せずGETで確認する。 |
 | worker起動/回収中、busy、生成失敗 (`reason=backend_unavailable`) | 503 | workerが制御結果を返せない。frame送信前後を問わず自動再送せず、GETで確認する。 |
@@ -47,7 +52,7 @@ controlは実行中の1 refresh完了後に1件だけ待機でき、後続refres
 
 | Method | Path | 説明 |
 |--------|------|------|
-| GET | `/status?floor=<1\|2>` | エアコンのfresh snapshot。`floor`は必須 |
+| GET | `/status?floor=<n>` | 検出済み階のエアコンfresh snapshot。`floor`は必須 |
 | GET | `/security/status` | 鍵・シャッター状態取得 |
 | POST | `/control` | エアコン操作 |
 | POST | `/security/lock` | 鍵操作 |
@@ -66,6 +71,7 @@ curl -H "X-API-Key: <read_key>" http://<api-host>:5000/status?floor=1
   "mode": "暖房",
   "temperature": 22.0,
   "power": "ON",
+  "floors": [1, 2],
   "snapshot": {
     "observed_at": "2026-08-27T06:00:00Z",
     "age_seconds": 2.4,
@@ -75,7 +81,7 @@ curl -H "X-API-Key: <read_key>" http://<api-host>:5000/status?floor=1
 }
 ```
 
-認証済みで`floor`を省略、または`1|2`以外を指定した場合は`400`。未認証なら入力検証より先に`401`を返す。
+`floors`は現在のworkerがコントローラー画面から検出した正整数の階一覧。認証済みで`floor`を省略、または一覧にない階を指定した場合は`400`。worker未readyで階一覧が未確定なら`503 {"reason":"floors_unknown"}`。未認証なら入力検証より先に`401`を返す。
 
 ### GET /security/status
 
@@ -88,6 +94,7 @@ curl -H "X-API-Key: <read_key>" http://<api-host>:5000/security/status
 {
   "lock": "LOCKED",
   "shutter": "CLOSED",
+  "capabilities": {"lock": "available", "shutter": "available"},
   "snapshot": {
     "observed_at": "2026-08-27T06:00:04Z",
     "age_seconds": 1.1,
@@ -96,6 +103,8 @@ curl -H "X-API-Key: <read_key>" http://<api-host>:5000/security/status
   }
 }
 ```
+
+`lock`は`LOCKED|UNLOCKED|UNKNOWN|NOT_INSTALLED|DISABLED`、`shutter`は`OPEN|CLOSED|UNKNOWN|NOT_INSTALLED`。`capabilities.lock`は`available|not_installed|disabled`、`capabilities.shutter`は`available|not_installed`を返す。
 
 利用不可時の共通例（状態bodyは含めない）:
 
@@ -123,7 +132,7 @@ curl -X POST -H "X-API-Key: <control_key>" -H "Content-Type: application/json" \
 
 | パラメータ | 型 | 値 |
 |-----------|----|----|
-| `floor` | int | `1` または `2` |
+| `floor` | int | `floors` に含まれる検出済み階。省略時は全検出階を更新 |
 | `mode` | string | `暖房` `冷房` `除湿` `自動` `送風` |
 | `temp` | number | `17` 〜 `30` の整数℃（`20.0` は可、`20.5` は不可） |
 | `power` | string | `ON` または `OFF` |
@@ -165,6 +174,8 @@ curl -X POST -H "X-API-Key: <control_key>" -H "Content-Type: application/json" \
 
 `action`: `lock` または `unlock`
 
+`HEMS_DISABLE_LOCK=true`なら`403 {"reason":"lock_disabled"}`、未搭載なら`501 {"reason":"lock_not_installed"}`、構成snapshotが未取得/staleなら`503 {"reason":"capabilities_unknown"}`。いずれもworkerへ送らずレート制限窓を消費しない。
+
 ### POST /security/shutter
 
 ```bash
@@ -174,6 +185,8 @@ curl -X POST -H "X-API-Key: <control_key>" -H "Content-Type: application/json" \
 ```
 
 `action`: `open` または `close`
+
+未搭載なら`501 {"reason":"shutter_not_installed"}`、構成snapshotが未取得/staleなら`503 {"reason":"capabilities_unknown"}`。いずれもworkerへ送らずレート制限窓を消費しない。
 
 ## セットアップ
 
@@ -185,6 +198,7 @@ HEMS_USER=<hems-user>
 HEMS_PASSWORD=<password>
 HEMS_API_KEY_READ=<generated_key>
 HEMS_API_KEY_CONTROL=<generated_key>
+HEMS_DISABLE_LOCK=false
 ```
 
 APIキー生成:
@@ -236,7 +250,7 @@ APIキーは `secrets.yaml` に `hems_api_key_read` / `hems_api_key_control` を
 - `sensor` のHTTP timeoutは3件とも10秒。GETはcache参照だけで即時応答し、background readの6秒deadlineとは分離される
 - `rest_command` × 3: エアコン制御・鍵・シャッター操作。HTTP timeoutは3件とも30秒（APIの制御command deadline 25秒、HTTP上限27秒より後に切断する）
 - `mqtt climate` × 2: 1F/2FエアコンをHAのClimateエンティティとして公開（`optimistic: false`）。
-- `automation`: MQTT ↔ REST API のブリッジ。4つの空調command automationは`rest_command.hems_control`を1回だけ呼び、`continue_on_error: true`でHTTPエラー後も直後のread-onlyな`homeassistant.update_entity`を1回だけ実行する。delay/retry/queueは持たず、制御を自動再送しない。REST sensorが`unknown`/`unavailable`、空調の期待`floor`不一致、または`power`が`ON`/`OFF`以外の場合はretainを更新しない。空調modeは、`OFF`ならmode/temperature欠落でも`off`をpublishし、`ON`ならmode allowlist（暖房/冷房/除湿/自動/送風）を要求する。温度は`ON`かつ暖房/冷房/自動で数値の場合だけpublishし、除湿/送風など温度非対応時はmodeだけ更新して直前の温度retainを保持する。securityは`lock`が`LOCKED`/`UNLOCKED`、`shutter`が`OPEN`/`CLOSED`の両方を満たす場合だけretainを更新し、復旧して有効値が揃ったpollでのみ反映する。
+- `automation`: MQTT ↔ REST API のブリッジ。4つの空調command automationは`rest_command.hems_control`を1回だけ呼び、`continue_on_error: true`でHTTPエラー後も直後のread-onlyな`homeassistant.update_entity`を1回だけ実行する。delay/retry/queueは持たず、制御を自動再送しない。REST sensorが`unknown`/`unavailable`、空調の期待`floor`不一致、または`power`が`ON`/`OFF`以外の場合はretainを更新しない。空調modeは、`OFF`ならmode/temperature欠落でも`off`をpublishし、`ON`ならmode allowlist（暖房/冷房/除湿/自動/送風）を要求する。温度は`ON`かつ暖房/冷房/自動で数値の場合だけpublishし、除湿/送風など温度非対応時はmodeだけ更新して直前の温度retainを保持する。securityはlockとshutterを別々の`if` guardでpublishするため、lockが`NOT_INSTALLED`/`DISABLED`でも有効なshutter状態は更新する。
 
 HAの正本とリポジトリのレビュー用コピーを比較してから、別途承認を得た場合だけ正本へ反映する。正本反映後は **Developer Tools → YAML → Reload all YAML** を実行する。
 

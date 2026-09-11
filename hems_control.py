@@ -8,6 +8,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.service import Service as ChromeService
+from hems_runtime import parse_bool_env
 
 # HEMS のスマート・エアーズ画面は初期 HTML 返却後に AJAX で状態を流し込む。
 # 流し込み前の DOM は「電源 img=stop_off, 全モード btn_mode_off, 温度 '--', floor li の <a> が display:none」で、
@@ -52,6 +53,8 @@ class HEMSController:
         self._off_to_on_transition = False
         self._power_confirmed = False
         self._mode_ready = True
+        self._disable_lock = parse_bool_env("HEMS_DISABLE_LOCK")
+        self._security_capabilities = None
         self._init_driver()
 
     @property
@@ -68,6 +71,12 @@ class HEMSController:
     def mode_ready(self):
         """OFF→ON 後にモード UI の反映完了を確認できたか。"""
         return self._mode_ready
+
+    @property
+    def security_capabilities(self):
+        if self._security_capabilities is None:
+            return None
+        return dict(self._security_capabilities)
 
     def _init_driver(self):
         options = webdriver.ChromeOptions()
@@ -195,6 +204,7 @@ class HEMSController:
 
     def login(self, *, deadline=None):
         """Logs into the HEMS system."""
+        self._security_capabilities = None
         print(f"Connecting to {self.base_url}...")
         try:
             self._clamp_deadline_timeouts(deadline)
@@ -319,6 +329,20 @@ class HEMSController:
             return
         raise TimeoutException("Smart Airs page state did not become ready (AJAX not populated).")
 
+    def detected_floors(self):
+        floors = set()
+        for element in self.driver.find_elements(
+            By.CSS_SELECTOR, "#floor-box li a[id^='floor_']"
+        ):
+            element_id = element.get_attribute("id") or ""
+            prefix, separator, value = element_id.partition("_")
+            if prefix != "floor" or separator != "_" or not value.isdigit():
+                continue
+            floor = int(value)
+            if floor > 0:
+                floors.add(floor)
+        return sorted(floors)
+
     def _wait_until(self, predicate, timeout=10, interval=0.3, deadline=None):
         end = self._operation_deadline(timeout, deadline)
         while time.monotonic() < end:
@@ -334,19 +358,77 @@ class HEMSController:
                 break
         return False
 
-    def _security_state_ready(self):
-        """玄関ロックの span に btn_on_* が出ていれば AJAX 反映済み。"""
+    def _security_container(self, device):
+        if device == "lock":
+            return self.driver.find_element(By.ID, "lalock")
+        return self._visible_shutter_li()
+
+    def _security_device_state_ready(self, device):
+        """搭載済み機器の相反する状態 span が AJAX 反映済みかを返す。"""
         try:
-            spans = self.driver.find_elements(By.CSS_SELECTOR, "#lalock span")
-            for s in spans:
-                cls = s.get_attribute("class") or ""
-                if "btn_on_left" in cls or "btn_on_right" in cls:
-                    return True
+            container = self._security_container(device)
+            if device == "lock":
+                spans = self.driver.find_elements(By.CSS_SELECTOR, "#lalock span")
+            else:
+                spans = [
+                    container.find_element(
+                        By.XPATH, f".//span[normalize-space(text())='{label}']"
+                    )
+                    for label in ("開", "閉")
+                ]
+            return any(self._has_btn_on(span.get_attribute("class")) for span in spans)
         except Exception as error:
             if self._is_session_dead(error):
                 raise
             return False
-        return False
+
+    def _detect_security_capabilities(self, *, deadline=None):
+        capabilities = {"lock": "disabled"} if self._disable_lock else {}
+        devices = [device for device in ("lock", "shutter") if device not in capabilities]
+        seen = {device: False for device in devices}
+
+        def all_ready():
+            for device in devices:
+                if capabilities.get(device) == "available":
+                    continue
+                try:
+                    self._security_container(device)
+                    seen[device] = True
+                except Exception as error:
+                    if self._is_session_dead(error):
+                        raise
+                    continue
+                if self._security_device_state_ready(device):
+                    capabilities[device] = "available"
+            return all(capabilities.get(device) == "available" for device in devices)
+
+        self._wait_until(all_ready, timeout=STATE_READY_TIMEOUT, deadline=deadline)
+        for device in devices:
+            if capabilities.get(device) == "available":
+                continue
+            if seen[device]:
+                raise TimeoutException(
+                    f"Security {device} state did not become ready (AJAX not populated)."
+                )
+            capabilities[device] = "not_installed"
+        return capabilities
+
+    def _ensure_security_capabilities(self, *, deadline=None):
+        if self._security_capabilities is None:
+            self._security_capabilities = self._detect_security_capabilities(
+                deadline=deadline
+            )
+            return
+
+        for device, capability in self._security_capabilities.items():
+            if capability == "available" and not self._wait_until(
+                lambda device=device: self._security_device_state_ready(device),
+                timeout=STATE_READY_TIMEOUT,
+                deadline=deadline,
+            ):
+                raise TimeoutException(
+                    f"Security {device} state did not become ready (AJAX not populated)."
+                )
 
     def navigate_to_smart_airs(self, force_reload=False, *, deadline=None):
         """Smart Airs ページに遷移。
@@ -384,24 +466,21 @@ class HEMSController:
         try:
             self.driver.get(target_url)
             self._wait_for(
-                EC.presence_of_element_located((By.ID, "lalock")),
+                EC.presence_of_element_located((By.ID, "header")),
                 timeout=10,
                 deadline=deadline,
             )
-            if not self._wait_until(
-                self._security_state_ready,
-                timeout=STATE_READY_TIMEOUT,
-                deadline=deadline,
-            ):
-                raise TimeoutException("Security page state did not become ready (AJAX not populated).")
+            if "DUIHS0001.cgi" not in self.driver.current_url:
+                raise TimeoutException("Security page navigation did not reach the target URL.")
+            self._ensure_security_capabilities(deadline=deadline)
             print("Arrived at Security page.")
         except Exception as e:
             print(f"Navigation to Security failed: {e}")
             raise
 
     def _current_floor(self):
-        """floor_1 / floor_2 の span を見て、現在選択中のフロアを返す (不明時 None)。"""
-        for fl in (1, 2):
+        """検出済み floor の span を見て、現在選択中のフロアを返す。"""
+        for fl in self.detected_floors():
             try:
                 span = self.driver.find_element(By.CSS_SELECTOR, f"#floor_{fl} span")
                 if "btn_mode_on" in (span.get_attribute("class") or ""):
@@ -718,53 +797,62 @@ class HEMSController:
     def get_security_status(self, *, deadline=None):
         self.navigate_to_security(deadline=deadline)
         print("Getting security status...")
-        status = {}
+        capabilities = self.security_capabilities
+        status = {"capabilities": capabilities}
 
         # Lock
-        try:
-            lock_section = self.driver.find_element(By.ID, "lalock")
-            lock_cls = lock_section.find_element(
-                By.XPATH, ".//span[normalize-space(text())='施錠']"
-            ).get_attribute("class") or ""
-            unlock_cls = lock_section.find_element(
-                By.XPATH, ".//span[normalize-space(text())='解錠']"
-            ).get_attribute("class") or ""
+        if capabilities["lock"] == "disabled":
+            status["lock"] = "DISABLED"
+        elif capabilities["lock"] == "not_installed":
+            status["lock"] = "NOT_INSTALLED"
+        else:
+            try:
+                lock_section = self.driver.find_element(By.ID, "lalock")
+                lock_cls = lock_section.find_element(
+                    By.XPATH, ".//span[normalize-space(text())='施錠']"
+                ).get_attribute("class") or ""
+                unlock_cls = lock_section.find_element(
+                    By.XPATH, ".//span[normalize-space(text())='解錠']"
+                ).get_attribute("class") or ""
 
-            lock_on = self._has_btn_on(lock_cls)
-            unlock_on = self._has_btn_on(unlock_cls)
-            if lock_on and not unlock_on:
-                status['lock'] = "LOCKED"
-            elif unlock_on and not lock_on:
-                status['lock'] = "UNLOCKED"
-            else:
-                print(f"DEBUG: Lock Unknown. lock='{lock_cls}' unlock='{unlock_cls}'")
+                lock_on = self._has_btn_on(lock_cls)
+                unlock_on = self._has_btn_on(unlock_cls)
+                if lock_on and not unlock_on:
+                    status['lock'] = "LOCKED"
+                elif unlock_on and not lock_on:
+                    status['lock'] = "UNLOCKED"
+                else:
+                    print(f"DEBUG: Lock Unknown. lock='{lock_cls}' unlock='{unlock_cls}'")
+                    status['lock'] = "UNKNOWN"
+            except Exception as e:
+                print(f"DEBUG: Lock detection failed: {e}")
                 status['lock'] = "UNKNOWN"
-        except Exception as e:
-            print(f"DEBUG: Lock detection failed: {e}")
-            status['lock'] = "UNKNOWN"
 
         # Shutter
-        try:
-            visible_li = self._visible_shutter_li()
-            open_cls = visible_li.find_element(
-                By.XPATH, ".//span[normalize-space(text())='開']"
-            ).get_attribute("class") or ""
-            close_cls = visible_li.find_element(
-                By.XPATH, ".//span[normalize-space(text())='閉']"
-            ).get_attribute("class") or ""
+        if capabilities["shutter"] == "not_installed":
+            status["shutter"] = "NOT_INSTALLED"
+        else:
+            try:
+                visible_li = self._visible_shutter_li()
+                open_cls = visible_li.find_element(
+                    By.XPATH, ".//span[normalize-space(text())='開']"
+                ).get_attribute("class") or ""
+                close_cls = visible_li.find_element(
+                    By.XPATH, ".//span[normalize-space(text())='閉']"
+                ).get_attribute("class") or ""
 
-            open_on = self._has_btn_on(open_cls)
-            close_on = self._has_btn_on(close_cls)
-            if open_on and not close_on:
-                status['shutter'] = "OPEN"
-            elif close_on and not open_on:
-                status['shutter'] = "CLOSED"
-            else:
-                print(f"DEBUG: Shutter Unknown. open='{open_cls}' close='{close_cls}'")
+                open_on = self._has_btn_on(open_cls)
+                close_on = self._has_btn_on(close_cls)
+                if open_on and not close_on:
+                    status['shutter'] = "OPEN"
+                elif close_on and not open_on:
+                    status['shutter'] = "CLOSED"
+                else:
+                    print(f"DEBUG: Shutter Unknown. open='{open_cls}' close='{close_cls}'")
+                    status['shutter'] = "UNKNOWN"
+            except Exception as e:
+                print(f"DEBUG: Shutter detection failed: {e}")
                 status['shutter'] = "UNKNOWN"
-        except Exception as e:
-            print(f"DEBUG: Shutter detection failed: {e}")
-            status['shutter'] = "UNKNOWN"
 
         return status
 
@@ -889,7 +977,7 @@ def main(argv=None):
     )
     parser.add_argument("--user", help="Login ID", required=True)
     parser.add_argument("--password", help="Login Password", required=True)
-    parser.add_argument("--floor", type=int, choices=[1, 2], help="Target floor for --status")
+    parser.add_argument("--floor", type=int, help="Target floor for --status")
     parser.add_argument("--mode", choices=["暖房", "冷房", "除湿", "自動", "送風"])
     parser.add_argument("--temp", type=float)
     parser.add_argument("--power", choices=["ON", "OFF"])
@@ -920,6 +1008,16 @@ def main(argv=None):
     try:
         controller.login()
         if args.status:
+            if args.floor is not None:
+                controller.navigate_to_smart_airs()
+                floors = controller.detected_floors()
+                if args.floor not in floors:
+                    detected = ", ".join(str(floor) for floor in floors) or "none"
+                    print(
+                        f"Invalid floor {args.floor}; detected floors: {detected}",
+                        file=sys.stderr,
+                    )
+                    return 2
             print(
                 json.dumps(
                     controller.get_current_status(target_floor=args.floor),

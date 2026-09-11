@@ -2,6 +2,8 @@
 # Replaces broken Template Climate with MQTT Climate Bridge.
 
 sensor:
+  # Add or remove floor-specific REST sensors, MQTT climates, and automations to
+  # match the `floors` list returned by GET /status.
   # Floor 1 Status (Source of Truth)
   - platform: rest
     name: "HEMS Aircon 1F Status"
@@ -46,6 +48,7 @@ sensor:
       - shutter
       - shutter_open_class
       - shutter_close_class
+      - capabilities
     value_template: "{{ value_json.lock }}"
 
 rest_command:
@@ -64,6 +67,7 @@ rest_command:
         {% if power is defined %}"power": "{{ power }}"{% endif %}
       }
 
+  # If no door lock is installed, or HEMS_DISABLE_LOCK=true, remove this block.
   hems_lock_control:
     url: "http://hems-api.example.invalid:5000/security/lock"
     method: POST
@@ -110,6 +114,7 @@ mqtt:
       temp_step: 1
       precision: 1.0
 
+  # If no door lock is installed, or HEMS_DISABLE_LOCK=true, remove this block.
   lock:
     - name: "HEMS Front Door"
       unique_id: "hems_front_door_lock"
@@ -311,32 +316,38 @@ automation:
         entity_id: sensor.hems_security_status
       - platform: homeassistant
         event: start
-    # 不明値や未対応値は、retainedなUNKNOWN/Noneで有効状態を上書きしない。
+    # snapshot 自体が利用不能なら、どの retained state も更新しない。
     condition:
       - condition: template
         value_template: >-
-          {{ states('sensor.hems_security_status') not in ['unknown', 'unavailable']
-             and state_attr('sensor.hems_security_status', 'lock') in ['LOCKED', 'UNLOCKED']
-             and state_attr('sensor.hems_security_status', 'shutter') in ['OPEN', 'CLOSED'] }}
+          {{ states('sensor.hems_security_status') not in ['unknown', 'unavailable'] }}
     action:
-      # Lock Status
-      - service: mqtt.publish
-        data:
-          topic: "hems/security/lock/state"
-          retain: true
-          payload: >
-            {% if state_attr('sensor.hems_security_status', 'lock') == 'LOCKED' %}LOCKED
-            {% elif state_attr('sensor.hems_security_status', 'lock') == 'UNLOCKED' %}UNLOCKED
-            {% endif %}
+      # Lock Status: NOT_INSTALLED / DISABLED / UNKNOWN は既存retainを上書きしない。
+      - if:
+          - condition: template
+            value_template: >-
+              {{ state_attr('sensor.hems_security_status', 'lock') in ['LOCKED', 'UNLOCKED'] }}
+        then:
+          - service: mqtt.publish
+            data:
+              topic: "hems/security/lock/state"
+              retain: true
+              payload: "{{ state_attr('sensor.hems_security_status', 'lock') }}"
 
-      # Shutter Status
-      - service: mqtt.publish
-        data:
-          topic: "hems/security/shutter/state"
-          retain: true
-          payload: "{{ state_attr('sensor.hems_security_status', 'shutter') }}"
+      # Shutter Status: lockが無くても独立してpublishする。
+      - if:
+          - condition: template
+            value_template: >-
+              {{ state_attr('sensor.hems_security_status', 'shutter') in ['OPEN', 'CLOSED'] }}
+        then:
+          - service: mqtt.publish
+            data:
+              topic: "hems/security/shutter/state"
+              retain: true
+              payload: "{{ state_attr('sensor.hems_security_status', 'shutter') }}"
 
   # 2. MQTT Lock Command -> REST API
+  # If no door lock is installed, or HEMS_DISABLE_LOCK=true, remove this automation.
   - alias: "HEMS Security: Handle Lock Command"
     trigger:
       - platform: mqtt
