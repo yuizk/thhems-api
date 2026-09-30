@@ -13,8 +13,8 @@ from hems_runtime import RuntimeUnavailable
 from hems_snapshot import SnapshotCoordinator, SnapshotStore
 
 
-READ_KEY = "test-read-key"
-CONTROL_KEY = "test-control-key"
+READ_KEY = "test-read-key-0123456789abcdef0123456789"
+CONTROL_KEY = "test-control-key-0123456789abcdef0123456789"
 
 
 def _status(**overrides):
@@ -142,6 +142,27 @@ def test_api_parent_fails_fast_for_invalid_disable_lock(monkeypatch):
     monkeypatch.setenv("HEMS_DISABLE_LOCK", "enabled")
     try:
         with pytest.raises(ValueError, match="HEMS_DISABLE_LOCK"):
+            importlib.import_module("hems_api")
+    finally:
+        sys.modules["hems_api"] = original
+
+
+@pytest.mark.parametrize(
+    ("read_key", "control_key", "expected"),
+    [
+        ("replace-with-random-read-key", CONTROL_KEY, "HEMS_API_KEY_READ is still the .env.example placeholder"),
+        (READ_KEY, "replace-with-random-control-key", "HEMS_API_KEY_CONTROL is still the .env.example placeholder"),
+        ("short-read-key", CONTROL_KEY, "HEMS_API_KEY_READ must be at least 32 characters"),
+        (READ_KEY, "x" * 31, "HEMS_API_KEY_CONTROL must be at least 32 characters"),
+        (CONTROL_KEY, CONTROL_KEY, "must be different"),
+    ],
+)
+def test_api_parent_rejects_unsafe_api_keys(monkeypatch, read_key, control_key, expected):
+    original = sys.modules.pop("hems_api")
+    monkeypatch.setenv("HEMS_API_KEY_READ", read_key)
+    monkeypatch.setenv("HEMS_API_KEY_CONTROL", control_key)
+    try:
+        with pytest.raises(ValueError, match=expected):
             importlib.import_module("hems_api")
     finally:
         sys.modules["hems_api"] = original

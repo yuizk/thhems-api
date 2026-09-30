@@ -14,16 +14,30 @@ from hems_snapshot import SnapshotCoordinator, SnapshotStore
 
 app = Flask(__name__)
 
-API_KEY_READ = os.environ.get("HEMS_API_KEY_READ")
-API_KEY_CONTROL = os.environ.get("HEMS_API_KEY_CONTROL")
+API_KEY_MIN_LENGTH = 32
+API_KEY_PLACEHOLDER_PREFIX = "replace-with-"
+
+
+def _validate_api_key(name: str, value: str | None) -> str:
+    """公開済みプレースホルダーや推測可能な短いキーでの起動を拒否する。"""
+    if not value:
+        raise ValueError(f"{name} environment variable must be set.")
+    if value.startswith(API_KEY_PLACEHOLDER_PREFIX):
+        raise ValueError(f"{name} is still the .env.example placeholder; generate a random key.")
+    if len(value) < API_KEY_MIN_LENGTH:
+        raise ValueError(f"{name} must be at least {API_KEY_MIN_LENGTH} characters.")
+    return value
+
+
 if not os.environ.get("HEMS_URL", "").strip():
     raise ValueError("HEMS_URL environment variable must be set.")
 if not os.environ.get("HEMS_USER") or not os.environ.get("HEMS_PASSWORD"):
     raise ValueError("HEMS_USER and HEMS_PASSWORD environment variables must be set.")
-if not API_KEY_READ:
-    raise ValueError("HEMS_API_KEY_READ environment variable must be set.")
-if not API_KEY_CONTROL:
-    raise ValueError("HEMS_API_KEY_CONTROL environment variable must be set.")
+API_KEY_READ = _validate_api_key("HEMS_API_KEY_READ", os.environ.get("HEMS_API_KEY_READ"))
+API_KEY_CONTROL = _validate_api_key("HEMS_API_KEY_CONTROL", os.environ.get("HEMS_API_KEY_CONTROL"))
+if API_KEY_READ == API_KEY_CONTROL:
+    # 同一値だと READ キーで施錠・解錠まで可能になり、権限分離が成立しない。
+    raise ValueError("HEMS_API_KEY_READ and HEMS_API_KEY_CONTROL must be different.")
 parse_bool_env("HEMS_DISABLE_LOCK")
 
 # import は process/Chrome を一切起動しない。互換用 controller は Selenium を持たない。

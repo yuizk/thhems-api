@@ -29,7 +29,9 @@ docker compose up -d
 
 The controller URL, controller login, password, and separate READ / CONTROL API
 keys are required. Generate two independent random keys (for example with
-`openssl rand -hex 32`). `HEMS_DISABLE_LOCK` is optional and defaults to
+`openssl rand -hex 32`). The API refuses to start if a key is shorter than 32
+characters, still uses a `.env.example` placeholder, or if both keys are equal.
+`HEMS_DISABLE_LOCK` is optional and defaults to
 `false`. Do not commit `.env`. Starting the API connects to the configured
 controller for background reads.
 
