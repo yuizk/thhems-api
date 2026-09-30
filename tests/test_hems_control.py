@@ -1146,6 +1146,18 @@ def test_missing_chromedriver_path_fails_before_browser_start(monkeypatch):
     assert calls == []
 
 
+def test_docker_runs_as_dedicated_nonroot_user_with_writable_home():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    assert "groupadd --gid 10001 hems" in dockerfile
+    assert "useradd --uid 10001 --gid hems --create-home" in dockerfile
+    assert "HOME=/home/hems" in dockerfile
+    assert "XDG_CONFIG_HOME=/home/hems/.config" in dockerfile
+    assert "XDG_CACHE_HOME=/home/hems/.cache" in dockerfile
+    assert "install -d -o hems -g hems -m 0700" in dockerfile
+    assert [line for line in dockerfile.splitlines() if line.startswith("USER ")] == ["USER 10001:10001"]
+    assert dockerfile.index("USER 10001:10001") < dockerfile.index("ENTRYPOINT")
+
+
 def test_docker_resolves_latest_stable_chrome_and_matching_driver_at_build_time():
     dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
 

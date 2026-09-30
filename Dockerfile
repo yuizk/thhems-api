@@ -59,6 +59,15 @@ COPY hems_runtime.py .
 COPY hems_snapshot.py .
 COPY hems_api.py .
 
+# Chrome writes its temporary profile under /tmp and crashpad/config under HOME.
+RUN groupadd --gid 10001 hems \
+    && useradd --uid 10001 --gid hems --create-home --shell /usr/sbin/nologin hems \
+    && install -d -o hems -g hems -m 0700 /home/hems/.config /home/hems/.cache
+ENV HOME=/home/hems \
+    XDG_CONFIG_HOME=/home/hems/.config \
+    XDG_CACHE_HOME=/home/hems/.cache
+USER 10001:10001
+
 EXPOSE 5000
 
 ENTRYPOINT ["python3", "hems_api.py"]

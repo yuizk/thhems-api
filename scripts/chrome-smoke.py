@@ -24,6 +24,8 @@ reimplementing them, so a runtime regression fails the smoke directly:
    escaping the worker tree/PGID in a way the runtime does not tolerate).
 4. ``SeleniumRuntime._assert_container_is_clean`` within the runtime's own
    recovery deadline after ``close()``.
+5. Non-root runtime and live browser UIDs, writable HOME/XDG/tmp/shm, and
+   Chrome's temporary profile/cache creation and removal.
 
 ``login()`` / ``navigate_to_smart_airs()`` are never called: the smoke reaches
 no HEMS device and uses dummy credentials only.
@@ -34,9 +36,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
+import pwd
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 APP_DIR = os.environ.get("HEMS_APP_DIR", "/app")
@@ -161,6 +166,47 @@ def _crashpad_handlers(runtime_module) -> list[dict[str, object]]:
     ]
 
 
+def check_runtime_user() -> dict[str, object]:
+    """Check the image user and writable locations without changing launch flags."""
+    uid, gid = os.geteuid(), os.getegid()
+    if uid == 0 or gid == 0:
+        raise SmokeError(f"expected non-root runtime, got uid={uid} gid={gid}")
+    home = os.environ["HOME"]
+    if pwd.getpwuid(uid).pw_dir != home:
+        raise SmokeError("HOME does not match the runtime user's passwd entry")
+    paths = [home, os.environ["XDG_CONFIG_HOME"], os.environ["XDG_CACHE_HOME"], "/tmp", "/dev/shm"]
+    for path in paths:
+        with tempfile.TemporaryDirectory(prefix="hems-smoke-", dir=path) as directory:
+            probe = Path(directory) / "write-check"
+            probe.write_text("offline smoke")
+            if probe.stat().st_uid != uid:
+                raise SmokeError(f"unexpected file owner in {path}")
+        if Path(directory).exists():
+            raise SmokeError(f"temporary directory was not cleaned: {directory}")
+    return {"runtime_uid": uid, "runtime_gid": gid, "writable_paths": paths}
+
+
+def check_browser_users(runtime_module, driver) -> list[dict[str, object]]:
+    """Inspect live Chrome and ChromeDriver, including saved/filesystem UIDs."""
+    driver_pid = driver.service.process.pid
+    processes = [
+        process for process in runtime_module.SeleniumRuntime._list_processes()
+        if runtime_module.SeleniumRuntime._is_browser_process(process)
+    ]
+    if driver_pid not in {process.pid for process in processes} or not any(
+        Path(process.exe).name == "chrome" for process in processes
+    ):
+        raise SmokeError("live Chrome and ChromeDriver processes were not found")
+    result = []
+    for process in processes:
+        fields = dict(line.split(":", 1) for line in Path(f"/proc/{process.pid}/status").read_text().splitlines())
+        uids = [int(value) for value in fields["Uid"].split()]
+        if uids != [os.geteuid()] * 4:
+            raise SmokeError(f"unexpected browser UIDs: pid={process.pid} uids={uids}")
+        result.append({"pid": process.pid, "uids": uids, "cap_eff": fields["CapEff"].strip()})
+    return result
+
+
 def check_real_chrome() -> dict[str, object]:
     """Launch Chrome exactly like the worker does and assert the runtime invariants."""
     import hems_runtime
@@ -183,6 +229,13 @@ def check_real_chrome() -> dict[str, object]:
     try:
         hems_runtime.SeleniumRuntime._assert_descendants_in_group(pid, pgid)
         handlers = _crashpad_handlers(hems_runtime)
+        browser_users = check_browser_users(hems_runtime, controller.driver)
+        profile = Path(controller.driver.capabilities["chrome"]["userDataDir"])
+        cache = profile / "Default" / "Cache"
+        if not profile.is_dir() or profile.stat().st_uid != os.geteuid():
+            raise SmokeError("Chrome did not create a profile owned by the runtime user")
+        if not cache.is_dir() or cache.stat().st_uid != os.geteuid():
+            raise SmokeError("Chrome did not create its profile cache")
     finally:
         controller.close()
 
@@ -191,15 +244,20 @@ def check_real_chrome() -> dict[str, object]:
     if not runtime._wait_for_container_clean(clean_started + hems_runtime.RECOVERY_SECONDS):
         runtime._assert_container_is_clean()
         raise SmokeError("container did not become clean within the runtime recovery deadline")
+    if profile.exists():
+        raise SmokeError(f"Chrome temporary profile was not cleaned: {profile}")
     return {
         "chrome_launch_seconds": launch_seconds,
         "container_clean_seconds": round(time.monotonic() - clean_started, 3),
         "crashpad_handlers": handlers,
+        "browser_users": browser_users,
+        "profile_cache_created_and_cleaned": True,
     }
 
 
 def main() -> int:
     try:
+        user = check_runtime_user()
         info = check_build_info()
         chrome = check_real_chrome()
     except Exception as error:
@@ -211,6 +269,7 @@ def main() -> int:
         "chromedriver_version": info["chromedriver_version"],
         "chromedriver_binary_sha256": info["chromedriver_binary_sha256"],
         **chrome,
+        **user,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
