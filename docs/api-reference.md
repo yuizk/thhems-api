@@ -201,7 +201,7 @@ HEMS_API_KEY_CONTROL=<generated_key>
 HEMS_DISABLE_LOCK=false
 ```
 
-APIキー生成:
+APIキー生成（32文字以上・READ と CONTROL は別の値・`.env.example` のプレースホルダー不可。満たさない場合は起動時に `ValueError`）:
 ```bash
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```

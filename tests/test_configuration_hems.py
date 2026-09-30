@@ -185,7 +185,7 @@ def test_ha_mode_command_reaches_worker_with_expected_control_payload(
     assert body.get("mode") == expected_mode
 
     response = api_client.post(
-        "/control", json=body, headers={"X-API-Key": "test-control-key"}
+        "/control", json=body, headers={"X-API-Key": "test-control-key-0123456789abcdef0123456789"}
     )
 
     assert response.status_code == 200, response.get_json()

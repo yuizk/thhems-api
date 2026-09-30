@@ -18,8 +18,8 @@ import time as time_module
 os.environ.setdefault("HEMS_USER", "test-user")
 os.environ.setdefault("HEMS_PASSWORD", "test-password")
 os.environ.setdefault("HEMS_URL", "http://hems.example.invalid")
-os.environ.setdefault("HEMS_API_KEY_READ", "test-read-key")
-os.environ.setdefault("HEMS_API_KEY_CONTROL", "test-control-key")
+os.environ.setdefault("HEMS_API_KEY_READ", "test-read-key-0123456789abcdef0123456789")
+os.environ.setdefault("HEMS_API_KEY_CONTROL", "test-control-key-0123456789abcdef0123456789")
 
 from selenium import webdriver  # noqa: E402
 from selenium.common.exceptions import NoSuchElementException  # noqa: E402
