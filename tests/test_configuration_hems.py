@@ -1,8 +1,9 @@
+from itertools import product
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from jinja2 import Template
+from jinja2 import Environment
 import pytest
 import yaml
 
@@ -146,15 +147,20 @@ def control_runtime(monkeypatch):
     return runtime
 
 
+_JINJA = Environment()
+# HA の to_json と同じく ensure_ascii=False で JSON にする。
+_JINJA.filters["to_json"] = lambda value: json.dumps(value, ensure_ascii=False)
+
+
 def _ha_render(template, **context):
     # HA はテンプレート描画結果の前後空白を除去してからサービスデータへ渡す。
-    return Template(template).render(**context).strip()
+    return _JINJA.from_string(template).render(**context).strip()
 
 
-def _control_request_body(floor, mqtt_payload):
-    """HA が mode command を受けて /control へ送る body を、実テンプレートで再現する。"""
+def _control_request_body(floor, mqtt_payload, command_kind="Mode"):
+    """HA が command を受けて /control へ送る body を、実テンプレートで再現する。"""
     config = yaml.load(CONFIG.read_text(), Loader=_HaLoader)
-    alias = f"HEMS {floor}F: Handle Mode Command"
+    alias = f"HEMS {floor}F: Handle {command_kind} Command"
     automation = next(item for item in config["automation"] if item["alias"] == alias)
     service_data = automation["action"][0]["data"]
     context = {"trigger": {"payload": mqtt_payload}}
@@ -192,3 +198,75 @@ def test_ha_mode_command_reaches_worker_with_expected_control_payload(
     assert control_runtime.payloads == [
         {"floor": floor, "mode": expected_mode, "temp": None, "power": expected_power}
     ]
+
+
+_CONTROL_FIELDS = {"floor": "1", "mode": "暖房", "temp": "22", "power": "ON"}
+
+
+@pytest.mark.parametrize(
+    "present,empty_mode",
+    [
+        (present, empty_mode)
+        for present in product([False, True], repeat=4)
+        for empty_mode in ([False, True] if present[1] else [False])
+    ],
+)
+def test_ha_control_payload_is_valid_json_for_any_field_combination(present, empty_mode):
+    """どのフィールドを省いても正しい JSON になり、空の mode は含めない。"""
+    context = {
+        key: value
+        for (key, value), keep in zip(_CONTROL_FIELDS.items(), present)
+        if keep
+    }
+    if empty_mode:
+        context["mode"] = ""
+    template = _ha_config()["rest_command"]["hems_control"]["payload"]
+
+    body = json.loads(_ha_render(template, **context))
+
+    expected = {key for key, value in context.items() if value != ""}
+    assert set(body) == expected
+    if "floor" in body:
+        assert body["floor"] == 1
+    if "temp" in body:
+        assert body["temp"] == 22.0
+    if "mode" in body:
+        assert body["mode"] == "暖房"
+    if "power" in body:
+        assert body["power"] == "ON"
+
+
+@pytest.mark.parametrize("floor", [1, 2])
+def test_ha_temp_command_reaches_worker_with_expected_control_payload(
+    api_client, control_runtime, floor
+):
+    body = _control_request_body(floor, "22", command_kind="Temp")
+
+    response = api_client.post(
+        "/control", json=body, headers={"X-API-Key": "test-control-key"}
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert control_runtime.payloads == [
+        {"floor": floor, "mode": None, "temp": 22.0, "power": "ON"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "alias,service",
+    [
+        ("HEMS Security: Handle Lock Command", "rest_command.hems_lock_control"),
+        ("HEMS Security: Handle Shutter Command", "rest_command.hems_shutter_control"),
+    ],
+)
+def test_ha_security_commands_refresh_status_without_delay(alias, service):
+    """API は確認済みの応答を返す前に security snapshot を更新するので待たない（#343）。"""
+    automation = next(item for item in _ha_config()["automation"] if item["alias"] == alias)
+    actions = automation["action"]
+
+    assert [action.get("service") for action in actions] == [
+        service,
+        "homeassistant.update_entity",
+    ]
+    assert actions[1]["entity_id"] == "sensor.hems_security_status"
+    assert all("delay" not in action for action in actions)

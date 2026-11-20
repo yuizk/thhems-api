@@ -59,13 +59,15 @@ rest_command:
     headers:
       content-type: application/json
       X-API-Key: !secret hems_api_key_control
+    # Build a dict and serialize it so any omitted field still yields valid JSON.
+    # An empty mode is omitted.
     payload: >
-      {
-        {% if floor is defined %}"floor": {{ floor }},{% endif %}
-        {% if mode is defined and mode %}"mode": "{{ mode }}",{% endif %}
-        {% if temp is defined %}"temp": {{ temp }},{% endif %}
-        {% if power is defined %}"power": "{{ power }}"{% endif %}
-      }
+      {%- set body = {} -%}
+      {%- if floor is defined -%}{%- set body = dict(body, floor=floor | int) -%}{%- endif -%}
+      {%- if mode is defined and mode -%}{%- set body = dict(body, mode=mode) -%}{%- endif -%}
+      {%- if temp is defined -%}{%- set body = dict(body, temp=temp | float) -%}{%- endif -%}
+      {%- if power is defined -%}{%- set body = dict(body, power=power) -%}{%- endif -%}
+      {{ body | to_json }}
 
   # If no door lock is installed, or HEMS_DISABLE_LOCK=true, remove this block.
   hems_lock_control:
@@ -359,7 +361,6 @@ automation:
             {% if trigger.payload == 'LOCK' %}lock
             {% elif trigger.payload == 'UNLOCK' %}unlock
             {% endif %}
-      - delay: "00:00:05"
       - service: homeassistant.update_entity
         entity_id: sensor.hems_security_status
 
@@ -377,6 +378,5 @@ automation:
             {% elif trigger.payload == 'STOP' %}
              # HEMS might not support stop, map to nothing or special handling
             {% endif %}
-      - delay: "00:00:05"
       - service: homeassistant.update_entity
         entity_id: sensor.hems_security_status
